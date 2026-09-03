@@ -186,4 +186,14 @@ Accepted OpenAI fields: `model`, `messages`, `tools`, `stream`, `stream_options.
 - `system_fingerprint` carries the upstream gateway routing (`provider:generationId`, e.g. `xiaomi:gen_...`). A provider change means the prefix cache is invalid — clients can watch this field.
 - Cache affinity: `prompt_cache_key` (preferred) or `user` is forwarded as the gateway `x-session-id` header, giving the gateway a stickiness signal so one conversation lands on the same backend instead of cold-starting across nodes. Omit both and no header is sent.
 
+## Context window: who computes what
+
+OpenAI completions never return window metadata, so accounting lives on the client (UI/agent):
+
+- The client counts prompt tokens locally before sending, or reads ground-truth `usage.prompt_tokens` from responses.
+- The client reads `context_length` from `GET /v1/models` (provided here as an OpenRouter-style extension) and computes remaining = `context_length - prompt_tokens`.
+- The proxy never invents numbers: `usage` is forwarded from upstream truth, `context_length` is the documented model limit.
+
+What the proxy does for overflow: when upstream rejects with "prompt too long" (same signal the CLI uses to compact-and-retry), the proxy returns HTTP 400 `{"error": {"code": "context_length_exceeded", "type": "invalid_request_error", ...}}` (non-streaming) or the same object as an SSE `data:` error (streaming). Standard OpenAI agents match on that code to compact and retry themselves. All other upstream errors passthrough untouched.
+
 DeepSeek-style harness or any agent framework with an OpenAI-compatible provider: set provider base URL to `http://localhost:8080/v1`, api key to the user's CommandCode key, and model to one of the listed ids. Fetching is plain HTTP POST to `/v1/chat/completions` with SSE (`text/event-stream`) when `stream: true`, ending with `data: [DONE]`.

@@ -80,3 +80,24 @@ func TestRequestMapping(t *testing.T) {
 		t.Fatalf("ids must be unique: %q", a)
 	}
 }
+
+// ponytail: satu check untuk overflow mapping (window penuh → 400 OpenAI).
+func TestOverflowMapping(t *testing.T) {
+	if !isOverflow(400, []byte(`{"error":"prompt is too long for context window"}`)) {
+		t.Fatal("prompt-too-long must map")
+	}
+	if !isOverflow(413, []byte(`anything`)) {
+		t.Fatal("413 must map")
+	}
+	if isOverflow(403, []byte(`{"success":false,"error":{"code":"FORBIDDEN","message":"Model/provider not recognized"}}`)) {
+		t.Fatal("gateway 403 must passthrough, not map")
+	}
+	if isOverflow(400, []byte(`{"error":"invalid json"}`)) {
+		t.Fatal("generic 400 must passthrough, not map")
+	}
+	e := openaiError("context_length_exceeded", "m")
+	inner := e["error"].(map[string]any)
+	if inner["code"] != "context_length_exceeded" || inner["type"] != "invalid_request_error" {
+		t.Fatalf("bad shape: %v", e)
+	}
+}

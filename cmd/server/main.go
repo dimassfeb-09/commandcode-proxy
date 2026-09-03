@@ -53,6 +53,26 @@ func apiKey() string {
 	return a.APIKey
 }
 
+// reOverflow: sinyal "prompt too long" upstream, mirror regex classify CLI
+// (/prompt is too long|context.*(length|window)|max_tokens|maximum.*tokens/).
+var reOverflow = regexp.MustCompile(`(?i)prompt is too long|context.{0,20}(length|window)|maximum.{0,20}tokens|too many tokens|exceeds.*context`)
+
+// isOverflow: true bila upstream menolak karena window penuh.
+// Client OpenAI (SDK/Agent) match HTTP 400 + code context_length_exceeded
+// untuk compact/retry sendiri — jadi mapping ini yang bikin mereka bisa kerja.
+func isOverflow(status int, body []byte) bool {
+	if status == http.StatusRequestEntityTooLarge {
+		return true
+	}
+	return reOverflow.Match(body)
+}
+
+// openaiError: bentuk error OpenAI resmi {error:{message,type,code}}.
+func openaiError(code, msg string) map[string]any {
+	return map[string]any{"error": map[string]any{
+		"message": msg, "type": "invalid_request_error", "code": code}}
+}
+
 // requestKey: Bearer dari client = CommandCode key user, diteruskan ke upstream.
 // Fallback ke env/file bila header kosong (dev lokal single-user).
 // Di deploy: jangan set COMMANDCODE_API_KEY → header wajib.
@@ -434,6 +454,13 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 				b, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
 				w.Header().Set("Content-Type", "application/json")
+				if isOverflow(resp.StatusCode, b) {
+					// ponytail: window penuh → 400 OpenAI agar client compact/retry sendiri.
+					w.WriteHeader(http.StatusBadRequest)
+					json.NewEncoder(w).Encode(openaiError("context_length_exceeded",
+						"This model's maximum context length was exceeded. Compact the conversation and retry."))
+					return
+				}
 				w.WriteHeader(resp.StatusCode)
 				w.Write(b)
 				return
@@ -490,6 +517,8 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	// SSE tetap terbuka antar attempt; [DONE] cuma sekali di akhir.
 	streamErr := ""
+	var errStatus int
+	var errBody []byte
 	var fullText strings.Builder
 	var calls []tcOut
 	var rawLast, fp string
@@ -503,6 +532,7 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 			b, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			streamErr = fmt.Sprintf("upstream %d: %s", resp.StatusCode, string(b))
+			errStatus, errBody = resp.StatusCode, b
 			break
 		}
 		raw, emsg, i, o, c, rs, fpp, cc := pumpStream(resp.Body, func(t string) { fullText.WriteString(t); emit(t, nil) })
@@ -536,7 +566,13 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	if streamErr != "" {
 		emit("", "error")
-		fmt.Fprintf(w, "data: {\"error\":%q}\n\n", streamErr)
+		if isOverflow(errStatus, errBody) {
+			b, _ := json.Marshal(openaiError("context_length_exceeded",
+				"This model's maximum context length was exceeded. Compact the conversation and retry."))
+			fmt.Fprintf(w, "data: %s\n\n", b)
+		} else {
+			fmt.Fprintf(w, "data: {\"error\":%q}\n\n", streamErr)
+		}
 	} else {
 		if len(calls) == 0 {
 			if _, xc := extractXMLToolCalls(fullText.String()); len(xc) > 0 {
