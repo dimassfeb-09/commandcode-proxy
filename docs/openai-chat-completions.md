@@ -77,10 +77,15 @@ Field tambahan yang sering muncul tapi opsional: `system_fingerprint`, `usage`,
 
 Didukung: model/messages(array-aware)/tools/stream/include_usage/max_tokens +
 max_completion_tokens/temperature/reasoning_effort/user/prompt_cache_key,
+`tool_choice: "none"` (tools tidak dikirim; nilai lain tak ada padanan upstream),
 `refusal/logprobs/role` di response, `cached_tokens/reasoning_tokens`,
 `system_fingerprint`, 400 `context_length_exceeded`.
 Sengaja diabaikan (tanpa pasangan upstream, diterima-tapi-diabaikan):
 `top_p`, penalties, `seed`, `logit_bias`, `logprobs` request, `stop`,
-`n`, `response_format`, `tool_choice`, `parallel_tool_calls`, `modalities`,
+`n`, `response_format`, `tool_choice` selain `"none"`, `parallel_tool_calls`, `modalities`,
 `prediction`, `metadata`, `store`, `verbosity`, `audio`, `web_search_options`.
-Image/audio parts di-drop dari `content` array (hemat prefix, stabil cache).
+Bukti reverse (`createModelClient.complete`): body `params` upstream HANYA berisi
+`model/messages/tools/system/max_tokens/stream` + `temperature` (bila set) +
+`reasoning_effort` (bila model thinking). Field lain tak dikenal gateway.
+Image/audio parts di-drop (upstream paham `image` tapi hanya untuk model vision;
+proxy tak punya registry vision seperti CLI `supportsVision`, jadi drop = perilaku aman).

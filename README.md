@@ -183,7 +183,7 @@ Accepted OpenAI fields: `model`, `messages`, `tools`, `stream`, `stream_options.
 
 Message `content` accepts string or array of parts; text parts are joined, image/audio parts are dropped (keeps the prefix lean and cache-stable).
 
-Fields without an upstream counterpart are accepted but ignored: `top_p`, `frequency_penalty`, `presence_penalty`, `seed`, `logit_bias`, `logprobs`, `stop`, `n` (always 1 choice), `response_format`, `tool_choice`, `parallel_tool_calls`, `modalities`, `prediction`, `metadata`, `store`. Responses include spec-required `refusal: null`, `logprobs: null`, and `role: "assistant"` on the first stream delta.
+Fields without an upstream counterpart are accepted but ignored: `top_p`, `frequency_penalty`, `presence_penalty`, `seed`, `logit_bias`, `logprobs`, `stop`, `n` (always 1 choice), `response_format`, `tool_choice` (except `"none"`, which omits tools), `parallel_tool_calls`, `modalities`, `prediction`, `metadata`, `store`. Upstream only understands `model/messages/tools/system/max_tokens/stream` plus `temperature` and `reasoning_effort` (verified against the CLI wire code), so anything else cannot take effect. Responses include spec-required `refusal: null`, `logprobs: null`, and `role: "assistant"` on the first stream delta.
 
 - `finish_reason` is honest: upstream truncation surfaces as `"length"` (not `"stop"`), so clients continue instead of presenting cut-off text as final. `tool_calls` still takes precedence.
 - Every response has a unique `id` (`chatcmpl-cc-<rand>`).

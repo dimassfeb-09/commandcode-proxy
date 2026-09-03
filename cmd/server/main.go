@@ -166,6 +166,7 @@ type chatReq struct {
 	MaxComplTok *int      `json:"max_completion_tokens"`
 	Temperature *float64  `json:"temperature"`
 	ReasoningEffort any    `json:"reasoning_effort"`
+	ToolChoice      any    `json:"tool_choice"`
 	User            string `json:"user"`
 	PromptCacheKey  string `json:"prompt_cache_key"`
 	StreamOptions *struct {
@@ -444,6 +445,11 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	params := map[string]any{
 		"model": model, "messages": msgs, "tools": toWireTools(in.Tools),
 		"max_tokens": maxTok, "stream": true,
+	}
+	// tool_choice:"none" = jangan kirim tools (satu-satunya nilai yang
+	// upstream pahami; auto/required/named tak ada padanannya → abaikan).
+	if s, ok := in.ToolChoice.(string); ok && strings.EqualFold(s, "none") {
+		params["tools"] = []any{}
 	}
 	if system != "" {
 		params["system"] = system
