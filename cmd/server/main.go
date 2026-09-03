@@ -3,9 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"crypto/rand"
-	"crypto/subtle"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -54,36 +51,30 @@ func apiKey() string {
 	return a.APIKey
 }
 
-// proxyAPIKey: Bearer key untuk /v1/*, diisi dari PROXY_API_KEY
-// atau di-generate tiap run bila env kosong.
-var proxyAPIKey string
-
-func genProxyKey() string {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		panic("rand: " + err.Error())
+// requestKey: Bearer dari client = CommandCode key user, diteruskan ke upstream.
+// Fallback ke env/file bila header kosong (dev lokal single-user).
+// Di deploy: jangan set COMMANDCODE_API_KEY → header wajib.
+func requestKey(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	if strings.HasPrefix(h, "Bearer ") {
+		if k := strings.TrimSpace(strings.TrimPrefix(h, "Bearer ")); k != "" {
+			return k
+		}
 	}
-	return "ccp_" + hex.EncodeToString(b)
+	return apiKey()
 }
 
-// proxyAuth: tolak /v1/* tanpa Bearer yang cocok. /health tetap terbuka
-// untuk healthcheck (Fly/docker). Compare constant-time.
-func proxyAuth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		h := r.Header.Get("Authorization")
-		got := ""
-		if strings.HasPrefix(h, "Bearer ") {
-			got = strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
-		}
-		if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(proxyAPIKey)) != 1 {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
-				"message": "invalid proxy api key", "type": "invalid_request_error", "code": "invalid_api_key"}})
-			return
-		}
-		next(w, r)
+func requireKey(w http.ResponseWriter, r *http.Request) (string, bool) {
+	key := requestKey(r)
+	if key == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+			"message": "missing api key: send your CommandCode key as Authorization: Bearer <key>",
+			"type":    "invalid_request_error", "code": "invalid_api_key"}})
+		return "", false
 	}
+	return key, true
 }
 
 // ── OpenAI in ──
@@ -264,11 +255,7 @@ func extractXMLToolCalls(text string) (string, []tcOut) {
 	return strings.TrimSpace(clean), calls
 }
 
-func doUpstream(r *http.Request, body []byte) (*http.Response, error) {
-	key := apiKey()
-	if key == "" {
-		return nil, fmt.Errorf("missing api key: set COMMANDCODE_API_KEY or login via cmd")
-	}
+func doUpstream(r *http.Request, key string, body []byte) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(r.Context(), "POST", baseURL()+"/alpha/generate", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -289,6 +276,10 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	var in chatReq
 	if err := json.Unmarshal(raw, &in); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	key, ok := requireKey(w, r)
+	if !ok {
 		return
 	}
 	maxTok := 1024
@@ -330,7 +321,7 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 		var u usage
 		var calls []tcOut
 		for attempt := 0; attempt < maxAttempts; attempt++ {
-			resp, err := doUpstream(r, data)
+			resp, err := doUpstream(r, key, data)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadGateway)
 				return
@@ -398,7 +389,7 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	var fullText strings.Builder
 	var calls []tcOut
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		resp, err := doUpstream(r, data)
+		resp, err := doUpstream(r, key, data)
 		if err != nil {
 			streamErr = err.Error()
 			break
@@ -569,6 +560,9 @@ var validModels = []string{
 }
 
 func handleModels(w http.ResponseWriter, r *http.Request) {
+	if _, ok := requireKey(w, r); !ok {
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	data := make([]any, 0, len(validModels))
 	for _, id := range validModels {
@@ -596,15 +590,11 @@ func main() {
 	if port == "" {
 		port = defaultPort
 	}
-	// ponytail: key generated at RUN, not build — baked-in key is same for everyone, useless.
-	proxyAPIKey = strings.TrimSpace(os.Getenv("PROXY_API_KEY"))
-	if proxyAPIKey == "" {
-		proxyAPIKey = genProxyKey()
-		fmt.Printf("PROXY_API_KEY not set — generated: %s\n", proxyAPIKey)
-	}
+	// ponytail: key per-request dari Bearer client = CommandCode key user.
+	// COMMANDCODE_API_KEY hanya fallback dev lokal; di deploy jangan di-set.
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", proxyAuth(handleChat))
-	mux.HandleFunc("/v1/models", proxyAuth(handleModels))
+	mux.HandleFunc("/v1/chat/completions", handleChat)
+	mux.HandleFunc("/v1/models", handleModels)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"ok","model":"` + upstreamModel + `"}`))
