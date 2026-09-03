@@ -171,4 +171,10 @@ Upstream prefix-caches identical prompt prefixes. To get cache hits across turns
 
 `usage.prompt_tokens_details.cached_tokens` reports how many prompt tokens were cache hits. Verified: two identical requests scored 6144 then 7360 of 7397 prompt tokens cached.
 
+## Usage and context window (OpenAI-compatible)
+
+- Non-streaming: standard `usage` object with `prompt_tokens`, `completion_tokens`, `total_tokens`, plus `prompt_tokens_details.cached_tokens` and `completion_tokens_details.reasoning_tokens`.
+- Streaming: pass `"stream_options": {"include_usage": true}`. Intermediate chunks carry no `usage`; the final chunk before `data: [DONE]` has `"choices": []` and the populated `usage` object, exactly per the OpenAI spec. Verified with the official `openai` Python client (v2.24.0) for both modes.
+- Context window: `GET /v1/models` returns `context_length` per model (OpenRouter-style extension; official OpenAI omits it). Remaining window = `context_length - prompt_tokens`.
+
 DeepSeek-style harness or any agent framework with an OpenAI-compatible provider: set provider base URL to `http://localhost:8080/v1`, api key to the user's CommandCode key, and model to one of the listed ids. Fetching is plain HTTP POST to `/v1/chat/completions` with SSE (`text/event-stream`) when `stream: true`, ending with `data: [DONE]`.

@@ -115,6 +115,9 @@ type chatReq struct {
 	Stream      bool      `json:"stream"`
 	MaxTokens   *int      `json:"max_tokens"`
 	Temperature *float64  `json:"temperature"`
+	StreamOptions *struct {
+		IncludeUsage bool `json:"include_usage"`
+	} `json:"stream_options"`
 }
 
 // ── Wire out ──
@@ -183,10 +186,25 @@ func toWireMessages(ms []chatMsg) (system string, out []any) {
 type wireUsage struct {
 	InputTokens       int `json:"inputTokens"`
 	OutputTokens      int `json:"outputTokens"`
+	ReasoningTokens   int `json:"reasoningTokens"`
 	InputTokenDetails *struct {
 		CacheReadTokens  int `json:"cacheReadTokens"`
 		CacheWriteTokens int `json:"cacheWriteTokens"`
 	} `json:"inputTokenDetails"`
+	OutputTokenDetails *struct {
+		ReasoningTokens int `json:"reasoningTokens"`
+	} `json:"outputTokenDetails"`
+}
+
+// wireReason: reasoning tokens dari finish event (top-level, fallback detail).
+func wireReason(tu *wireUsage) int {
+	if tu.ReasoningTokens > 0 {
+		return tu.ReasoningTokens
+	}
+	if tu.OutputTokenDetails != nil {
+		return tu.OutputTokenDetails.ReasoningTokens
+	}
+	return 0
 }
 
 type wireEvent struct {
@@ -343,7 +361,7 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 			text, uu, raw, cc := collect(resp.Body)
 			resp.Body.Close()
 			sb.WriteString(text)
-			u = usage{u.inN + uu.inN, u.out + uu.out, u.cached + uu.cached}
+			u = usage{u.inN + uu.inN, u.out + uu.out, u.cached + uu.cached, u.reason + uu.reason}
 			calls = append(calls, cc...)
 			if raw != "pause_turn" {
 				break
@@ -406,9 +424,9 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 			streamErr = fmt.Sprintf("upstream %d: %s", resp.StatusCode, string(b))
 			break
 		}
-		raw, emsg, i, o, c, cc := pumpStream(resp.Body, func(t string) { fullText.WriteString(t); emit(t, nil, nil) })
+		raw, emsg, i, o, c, rs, cc := pumpStream(resp.Body, func(t string) { fullText.WriteString(t); emit(t, nil, nil) })
 		resp.Body.Close()
-		u = usage{u.inN + i, u.out + o, u.cached + c}
+		u = usage{u.inN + i, u.out + o, u.cached + c, u.reason + rs}
 		calls = append(calls, cc...)
 		if emsg != "" {
 			streamErr = emsg
@@ -448,26 +466,37 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 			emitTC(calls, 0)
 			finish = "tool_calls"
 		}
-		emit("", finish, &u)
+		emit("", finish, nil)
+		// ponytail: chunk usage terpisah choices=[] sesuai spec OpenAI
+		// (client baca usage bila stream_options.include_usage; selalu kirim biar cache hit kelihatan).
+		b, _ := json.Marshal(map[string]any{"id": "chatcmpl-cc", "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model,
+			"choices": []any{}, "usage": openaiUsage(u)})
+		fmt.Fprintf(w, "data: %s\n\n", b)
+		if fl != nil {
+			fl.Flush()
+		}
 	}
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 }
 
 // openaiUsage: bentuk usage OpenAI resmi (CompletionUsage):
-// prompt_tokens_details.cached_tokens = token yang kena cache hit.
+// prompt_tokens_details.cached_tokens = token yang kena cache hit,
+// completion_tokens_details.reasoning_tokens = token reasoning.
+// ponytail: selalu kirim dua details (default 0), sesuai spec.
 func openaiUsage(u usage) map[string]any {
 	return map[string]any{
 		"prompt_tokens": u.inN, "completion_tokens": u.out, "total_tokens": u.inN + u.out,
-		"prompt_tokens_details": map[string]any{"cached_tokens": u.cached},
+		"prompt_tokens_details":      map[string]any{"cached_tokens": u.cached},
+		"completion_tokens_details":  map[string]any{"reasoning_tokens": u.reason},
 	}
 }
 
-type usage struct{ inN, out, cached int }
+type usage struct{ inN, out, cached, reason int }
 
 // pumpStream memompa SATU attempt upstream → onText per text-delta.
 // return rawFinishReason ("pause_turn" = task belum kelar → panggil lagi)
 // + tool_calls terstruktur bila ada event tool-call.
-func pumpStream(body io.Reader, onText func(string)) (raw, errMsg string, inN, outN, cached int, calls []tcOut) {
+func pumpStream(body io.Reader, onText func(string)) (raw, errMsg string, inN, outN, cached, reason int, calls []tcOut) {
 	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
 	n := 0
@@ -498,7 +527,7 @@ func pumpStream(body io.Reader, onText func(string)) (raw, errMsg string, inN, o
 			calls = append(calls, newTCCall(id, name, wireInputArgs(e.Input)))
 		case "finish":
 			if e.TotalUsage != nil {
-				inN, outN = e.TotalUsage.InputTokens, e.TotalUsage.OutputTokens
+				inN, outN, reason = e.TotalUsage.InputTokens, e.TotalUsage.OutputTokens, wireReason(e.TotalUsage)
 				if e.TotalUsage.InputTokenDetails != nil {
 					cached = e.TotalUsage.InputTokenDetails.CacheReadTokens
 				}
@@ -547,7 +576,7 @@ func collect(r io.Reader) (string, usage, string, []tcOut) {
 			calls = append(calls, newTCCall(id, name, wireInputArgs(e.Input)))
 		} else if e.Type == "finish" {
 			if e.TotalUsage != nil {
-				u = usage{e.TotalUsage.InputTokens, e.TotalUsage.OutputTokens, 0}
+				u = usage{e.TotalUsage.InputTokens, e.TotalUsage.OutputTokens, 0, wireReason(e.TotalUsage)}
 				if e.TotalUsage.InputTokenDetails != nil {
 					u.cached = e.TotalUsage.InputTokenDetails.CacheReadTokens
 				}
