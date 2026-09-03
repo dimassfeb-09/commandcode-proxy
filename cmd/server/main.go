@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,7 +20,7 @@ import (
 
 const (
 	upstreamModel = "xiaomi/mimo-v2.5"
-	cliVersion    = "1.39.2"
+	cliVersion    = "1.44.0"
 	defaultPort   = "8080"
 	// ponytail: mirror CLI Jg=5 — re-POST while rawFinishReason=="pause_turn".
 	maxAttempts = 6
@@ -114,10 +116,56 @@ type chatReq struct {
 	Tools       []toolDef `json:"tools,omitempty"`
 	Stream      bool      `json:"stream"`
 	MaxTokens   *int      `json:"max_tokens"`
+	MaxComplTok *int      `json:"max_completion_tokens"`
 	Temperature *float64  `json:"temperature"`
+	ReasoningEffort any    `json:"reasoning_effort"`
+	User            string `json:"user"`
+	PromptCacheKey  string `json:"prompt_cache_key"`
 	StreamOptions *struct {
 		IncludeUsage bool `json:"include_usage"`
 	} `json:"stream_options"`
+}
+
+// resolveMaxTokens: max_tokens menang bila ada, else max_completion_tokens, else 1024.
+// (SDK baru kirim max_completion_tokens; tanpa ini → truncate sia-sia.)
+func resolveMaxTokens(in chatReq) int {
+	if in.MaxTokens != nil && *in.MaxTokens > 0 {
+		return *in.MaxTokens
+	}
+	if in.MaxComplTok != nil && *in.MaxComplTok > 0 {
+		return *in.MaxComplTok
+	}
+	return 1024
+}
+
+// mapFinish: tool_calls > length > stop. (raw length dilaporkan apa adanya
+// agar client continue, bukan kira jawaban final.)
+func mapFinish(nCalls int, raw string) string {
+	if nCalls > 0 {
+		return "tool_calls"
+	}
+	if raw == "length" || raw == "max_tokens" {
+		return "length"
+	}
+	return "stop"
+}
+
+// sessionAffinity: kunci afinitas sesi untuk x-session-id gateway
+// (prompt_cache_key resmi OpenAI, fallback user). "" = omit.
+func sessionAffinity(in chatReq) string {
+	if in.PromptCacheKey != "" {
+		return in.PromptCacheKey
+	}
+	return in.User
+}
+
+// newRespID: id unik per request (dedupe client by id).
+func newRespID() string {
+	b := make([]byte, 6)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("chatcmpl-cc-%d", time.Now().UnixNano())
+	}
+	return "chatcmpl-cc-" + hex.EncodeToString(b)
 }
 
 // ── Wire out ──
@@ -208,15 +256,40 @@ func wireReason(tu *wireUsage) int {
 }
 
 type wireEvent struct {
-	Type            string     `json:"type"`
-	Text            string     `json:"text"`
-	FinishReason    string     `json:"finishReason"`
-	RawFinishReason string     `json:"rawFinishReason"`
-	ToolName        string     `json:"toolName"`
-	ToolCallID      string     `json:"toolCallId"`
-	Input           any        `json:"input"`
-	TotalUsage      *wireUsage `json:"totalUsage"`
-	Message         string     `json:"message"`
+	Type             string         `json:"type"`
+	Text             string         `json:"text"`
+	FinishReason     string         `json:"finishReason"`
+	RawFinishReason  string         `json:"rawFinishReason"`
+	ToolName         string         `json:"toolName"`
+	ToolCallID       string         `json:"toolCallId"`
+	Input            any            `json:"input"`
+	TotalUsage       *wireUsage     `json:"totalUsage"`
+	ProviderMetadata map[string]any `json:"providerMetadata"`
+	Message          string         `json:"message"`
+}
+
+// wireFingerprint: provider+generationId dari event provider-metadata
+// → system_fingerprint OpenAI (client deteksi backend switch = cache invalid).
+func wireFingerprint(md map[string]any) string {
+	gw, _ := md["gateway"].(map[string]any)
+	if gw == nil {
+		return ""
+	}
+	gen, _ := gw["generationId"].(string)
+	prov, _ := gw["resolvedProvider"].(string)
+	if prov == "" {
+		if rt, _ := gw["routing"].(map[string]any); rt != nil {
+			prov, _ = rt["resolvedProvider"].(string)
+		}
+	}
+	switch {
+	case prov != "" && gen != "":
+		return prov + ":" + gen
+	case gen != "":
+		return gen
+	default:
+		return prov
+	}
 }
 
 // tcOut = OpenAI tool_call untuk response.
@@ -279,7 +352,7 @@ func extractXMLToolCalls(text string) (string, []tcOut) {
 	return strings.TrimSpace(clean), calls
 }
 
-func doUpstream(r *http.Request, key string, body []byte) (*http.Response, error) {
+func doUpstream(r *http.Request, key, sess string, body []byte) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(r.Context(), "POST", baseURL()+"/alpha/generate", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -288,6 +361,10 @@ func doUpstream(r *http.Request, key string, body []byte) (*http.Response, error
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("User-Agent", "cli") // required: without this → 403 Cloudflare 1010
 	req.Header.Set("x-command-code-version", cliVersion)
+	if sess != "" {
+		// afinitas sesi gateway (KV-cache locality); dari prompt_cache_key/user client.
+		req.Header.Set("x-session-id", sess)
+	}
 	return http.DefaultClient.Do(req)
 }
 
@@ -306,10 +383,9 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	maxTok := 1024
-	if in.MaxTokens != nil && *in.MaxTokens > 0 {
-		maxTok = *in.MaxTokens
-	}
+	rid := newRespID()
+	sess := sessionAffinity(in)
+	maxTok := resolveMaxTokens(in)
 	model := in.Model
 	if model == "" {
 		model = upstreamModel
@@ -328,6 +404,9 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	if in.Temperature != nil {
 		params["temperature"] = *in.Temperature
 	}
+	if in.ReasoningEffort != nil {
+		params["reasoning_effort"] = in.ReasoningEffort
+	}
 	wire := map[string]any{
 		"config": map[string]any{"workingDir": "/tmp", "date": time.Now().Format("2006-01-02"), "environment": "linux", "structure": []string{}, "isGitRepo": false, "currentBranch": "", "mainBranch": "", "gitStatus": "", "recentCommits": []string{}},
 		"memory": nil, "taste": nil, "skills": nil,
@@ -344,8 +423,9 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 		var sb strings.Builder
 		var u usage
 		var calls []tcOut
+		var rawLast, fp string
 		for attempt := 0; attempt < maxAttempts; attempt++ {
-			resp, err := doUpstream(r, key, data)
+			resp, err := doUpstream(r, key, sess, data)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadGateway)
 				return
@@ -358,11 +438,12 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 				w.Write(b)
 				return
 			}
-			text, uu, raw, cc := collect(resp.Body)
+			text, uu, raw, fpp, cc := collect(resp.Body)
 			resp.Body.Close()
 			sb.WriteString(text)
 			u = usage{u.inN + uu.inN, u.out + uu.out, u.cached + uu.cached, u.reason + uu.reason}
 			calls = append(calls, cc...)
+			rawLast, fp = raw, fpp
 			if raw != "pause_turn" {
 				break
 			}
@@ -375,15 +456,17 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		msg := map[string]any{"role": "assistant", "content": sb.String()}
-		finish := "stop"
-		if len(calls) > 0 {
+		finish := mapFinish(len(calls), rawLast)
+		if finish == "tool_calls" {
 			msg["tool_calls"] = calls
-			finish = "tool_calls"
 		}
 		out := map[string]any{
-			"id": "chatcmpl-cc", "object": "chat.completion", "created": time.Now().Unix(), "model": model,
+			"id": rid, "object": "chat.completion", "created": time.Now().Unix(), "model": model,
 			"choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": finish}},
 			"usage":   openaiUsage(u),
+		}
+		if fp != "" {
+			out["system_fingerprint"] = fp
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(out)
@@ -396,12 +479,9 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(200)
 	fl, _ := w.(http.Flusher)
 	var u usage
-	emit := func(delta string, finish any, uu *usage) {
-		chunk := map[string]any{"id": "chatcmpl-cc", "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model,
+	emit := func(delta string, finish any) {
+		chunk := map[string]any{"id": rid, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model,
 			"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": delta}, "finish_reason": finish}}}
-		if uu != nil {
-			chunk["usage"] = openaiUsage(*uu)
-		}
 		b, _ := json.Marshal(chunk)
 		fmt.Fprintf(w, "data: %s\n\n", b)
 		if fl != nil {
@@ -412,8 +492,9 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	streamErr := ""
 	var fullText strings.Builder
 	var calls []tcOut
+	var rawLast, fp string
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		resp, err := doUpstream(r, key, data)
+		resp, err := doUpstream(r, key, sess, data)
 		if err != nil {
 			streamErr = err.Error()
 			break
@@ -424,10 +505,11 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 			streamErr = fmt.Sprintf("upstream %d: %s", resp.StatusCode, string(b))
 			break
 		}
-		raw, emsg, i, o, c, rs, cc := pumpStream(resp.Body, func(t string) { fullText.WriteString(t); emit(t, nil, nil) })
+		raw, emsg, i, o, c, rs, fpp, cc := pumpStream(resp.Body, func(t string) { fullText.WriteString(t); emit(t, nil) })
 		resp.Body.Close()
 		u = usage{u.inN + i, u.out + o, u.cached + c, u.reason + rs}
 		calls = append(calls, cc...)
+		rawLast, fp = raw, fpp
 		if emsg != "" {
 			streamErr = emsg
 			break
@@ -443,7 +525,7 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 				map[string]any{"tool_calls": []any{map[string]any{"index": idx, "id": c.ID, "type": "function", "function": map[string]any{"name": c.Function.Name, "arguments": ""}}}},
 				map[string]any{"tool_calls": []any{map[string]any{"index": idx, "function": map[string]any{"arguments": c.Function.Arguments}}}},
 			} {
-				b, _ := json.Marshal(map[string]any{"id": "chatcmpl-cc", "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model,
+				b, _ := json.Marshal(map[string]any{"id": rid, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model,
 					"choices": []any{map[string]any{"index": 0, "delta": d, "finish_reason": nil}}})
 				fmt.Fprintf(w, "data: %s\n\n", b)
 				if fl != nil {
@@ -453,7 +535,7 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if streamErr != "" {
-		emit("", "error", nil)
+		emit("", "error")
 		fmt.Fprintf(w, "data: {\"error\":%q}\n\n", streamErr)
 	} else {
 		if len(calls) == 0 {
@@ -461,19 +543,24 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 				calls = xc // teks tag sudah terlanjur di-stream; yang penting client dapat tool_calls
 			}
 		}
-		finish := "stop"
-		if len(calls) > 0 {
+		finish := mapFinish(len(calls), rawLast)
+		if finish == "tool_calls" {
 			emitTC(calls, 0)
-			finish = "tool_calls"
 		}
-		emit("", finish, nil)
-		// ponytail: chunk usage terpisah choices=[] sesuai spec OpenAI
-		// (client baca usage bila stream_options.include_usage; selalu kirim biar cache hit kelihatan).
-		b, _ := json.Marshal(map[string]any{"id": "chatcmpl-cc", "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model,
-			"choices": []any{}, "usage": openaiUsage(u)})
-		fmt.Fprintf(w, "data: %s\n\n", b)
-		if fl != nil {
-			fl.Flush()
+		finChunk := map[string]any{"id": rid, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model,
+			"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": ""}, "finish_reason": finish}}}
+		useChunk := map[string]any{"id": rid, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model,
+			"choices": []any{}, "usage": openaiUsage(u)}
+		if fp != "" {
+			finChunk["system_fingerprint"], useChunk["system_fingerprint"] = fp, fp
+		}
+		// ponytail: chunk finish lalu chunk usage terpisah choices=[] sesuai spec OpenAI.
+		for _, ch := range []map[string]any{finChunk, useChunk} {
+			b, _ := json.Marshal(ch)
+			fmt.Fprintf(w, "data: %s\n\n", b)
+			if fl != nil {
+				fl.Flush()
+			}
 		}
 	}
 	fmt.Fprintf(w, "data: [DONE]\n\n")
@@ -495,8 +582,8 @@ type usage struct{ inN, out, cached, reason int }
 
 // pumpStream memompa SATU attempt upstream → onText per text-delta.
 // return rawFinishReason ("pause_turn" = task belum kelar → panggil lagi)
-// + tool_calls terstruktur bila ada event tool-call.
-func pumpStream(body io.Reader, onText func(string)) (raw, errMsg string, inN, outN, cached, reason int, calls []tcOut) {
+// + tool_calls terstruktur bila ada event tool-call + fingerprint backend.
+func pumpStream(body io.Reader, onText func(string)) (raw, errMsg string, inN, outN, cached, reason int, fp string, calls []tcOut) {
 	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
 	n := 0
@@ -533,6 +620,10 @@ func pumpStream(body io.Reader, onText func(string)) (raw, errMsg string, inN, o
 				}
 			}
 			raw = e.RawFinishReason
+		case "provider-metadata":
+			if f := wireFingerprint(e.ProviderMetadata); f != "" {
+				fp = f
+			}
 		case "error":
 			errMsg = e.Message
 			if errMsg == "" {
@@ -544,10 +635,10 @@ func pumpStream(body io.Reader, onText func(string)) (raw, errMsg string, inN, o
 	return
 }
 
-func collect(r io.Reader) (string, usage, string, []tcOut) {
+func collect(r io.Reader) (string, usage, string, string, []tcOut) {
 	var sb strings.Builder
 	var u usage
-	var raw string
+	var raw, fp string
 	var calls []tcOut
 	n := 0
 	sc := bufio.NewScanner(r)
@@ -582,9 +673,13 @@ func collect(r io.Reader) (string, usage, string, []tcOut) {
 				}
 			}
 			raw = e.RawFinishReason
+		} else if e.Type == "provider-metadata" {
+			if f := wireFingerprint(e.ProviderMetadata); f != "" {
+				fp = f
+			}
 		}
 	}
-	return sb.String(), u, raw, calls
+	return sb.String(), u, raw, fp, calls
 }
 
 // validModels: hasil test "hi" per model 2026-09-03 di akun ini (36/65).

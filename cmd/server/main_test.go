@@ -23,21 +23,60 @@ func TestExtractXMLToolCalls(t *testing.T) {
 	}
 }
 
-// ponytail: satu check untuk parsing cacheRead upstream → cached_tokens.
+// ponytail: satu check untuk parsing cacheRead upstream → cached_tokens + fingerprint.
 func TestCacheReadParsing(t *testing.T) {
 	ndjson := strings.NewReader(
 		`{"type":"text-delta","text":"hi"}` + "\n" +
-			`{"type":"finish","finishReason":"end_turn","rawFinishReason":"end_turn","totalUsage":{"inputTokens":1000,"outputTokens":10,"inputTokenDetails":{"cacheReadTokens":800,"cacheWriteTokens":200}}}` + "\n")
-	_, u, raw, _ := collect(ndjson)
+			`{"type":"finish","finishReason":"end_turn","rawFinishReason":"end_turn","totalUsage":{"inputTokens":1000,"outputTokens":10,"inputTokenDetails":{"cacheReadTokens":800,"cacheWriteTokens":200}}}` + "\n" +
+			`{"type":"provider-metadata","providerMetadata":{"gateway":{"generationId":"gen_abc","routing":{"resolvedProvider":"xiaomi"}}}}` + "\n")
+	_, u, raw, fp, _ := collect(ndjson)
 	if raw != "end_turn" {
 		t.Fatalf("bad raw: %q", raw)
 	}
 	if u.inN != 1000 || u.cached != 800 {
 		t.Fatalf("bad usage: %+v", u)
 	}
+	if fp != "xiaomi:gen_abc" {
+		t.Fatalf("bad fp: %q", fp)
+	}
 	out := openaiUsage(u)
 	d := out["prompt_tokens_details"].(map[string]any)
 	if d["cached_tokens"] != 800 {
 		t.Fatalf("bad cached_tokens: %v", out)
+	}
+}
+
+// ponytail: satu check untuk mapping request OpenAI → wire (P0+P1).
+func TestRequestMapping(t *testing.T) {
+	p := func(v int) *int { return &v }
+	if got := resolveMaxTokens(chatReq{MaxTokens: p(50), MaxComplTok: p(99)}); got != 50 {
+		t.Fatalf("max_tokens must win, got %d", got)
+	}
+	if got := resolveMaxTokens(chatReq{MaxComplTok: p(200)}); got != 200 {
+		t.Fatalf("max_completion_tokens fallback, got %d", got)
+	}
+	if got := resolveMaxTokens(chatReq{}); got != 1024 {
+		t.Fatalf("default 1024, got %d", got)
+	}
+	if got := mapFinish(0, "length"); got != "length" {
+		t.Fatalf("length must surface, got %q", got)
+	}
+	if got := mapFinish(2, "length"); got != "tool_calls" {
+		t.Fatalf("tool_calls wins, got %q", got)
+	}
+	if got := mapFinish(0, "end_turn"); got != "stop" {
+		t.Fatalf("default stop, got %q", got)
+	}
+	if got := sessionAffinity(chatReq{PromptCacheKey: "pc", User: "u"}); got != "pc" {
+		t.Fatalf("prompt_cache_key wins, got %q", got)
+	}
+	if got := sessionAffinity(chatReq{User: "u"}); got != "u" {
+		t.Fatalf("user fallback, got %q", got)
+	}
+	if got := sessionAffinity(chatReq{}); got != "" {
+		t.Fatalf("empty affinity, got %q", got)
+	}
+	if a, b := newRespID(), newRespID(); a == b {
+		t.Fatalf("ids must be unique: %q", a)
 	}
 }

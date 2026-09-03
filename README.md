@@ -177,4 +177,13 @@ Upstream prefix-caches identical prompt prefixes. To get cache hits across turns
 - Streaming: pass `"stream_options": {"include_usage": true}`. Intermediate chunks carry no `usage`; the final chunk before `data: [DONE]` has `"choices": []` and the populated `usage` object, exactly per the OpenAI spec. Verified with the official `openai` Python client (v2.24.0) for both modes.
 - Context window: `GET /v1/models` returns `context_length` per model (OpenRouter-style extension; official OpenAI omits it). Remaining window = `context_length - prompt_tokens`.
 
+## Request mapping notes
+
+Accepted OpenAI fields: `model`, `messages`, `tools`, `stream`, `stream_options.include_usage`, `max_tokens`, `max_completion_tokens` (fallback when `max_tokens` absent), `temperature`, `reasoning_effort` (forwarded to upstream), `user`, `prompt_cache_key`.
+
+- `finish_reason` is honest: upstream truncation surfaces as `"length"` (not `"stop"`), so clients continue instead of presenting cut-off text as final. `tool_calls` still takes precedence.
+- Every response has a unique `id` (`chatcmpl-cc-<rand>`).
+- `system_fingerprint` carries the upstream gateway routing (`provider:generationId`, e.g. `xiaomi:gen_...`). A provider change means the prefix cache is invalid — clients can watch this field.
+- Cache affinity: `prompt_cache_key` (preferred) or `user` is forwarded as the gateway `x-session-id` header, giving the gateway a stickiness signal so one conversation lands on the same backend instead of cold-starting across nodes. Omit both and no header is sent.
+
 DeepSeek-style harness or any agent framework with an OpenAI-compatible provider: set provider base URL to `http://localhost:8080/v1`, api key to the user's CommandCode key, and model to one of the listed ids. Fetching is plain HTTP POST to `/v1/chat/completions` with SSE (`text/event-stream`) when `stream: true`, ending with `data: [DONE]`.
