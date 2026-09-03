@@ -36,7 +36,7 @@ func TestCacheReadParsing(t *testing.T) {
 	if raw != "end_turn" {
 		t.Fatalf("bad raw: %q", raw)
 	}
-	if u.inN != 1000 || u.cached != 800 {
+	if u.prompt != 1000 || u.cached != 800 {
 		t.Fatalf("bad usage: %+v", u)
 	}
 	if fp != "xiaomi:gen_abc" {
@@ -52,13 +52,13 @@ func TestCacheReadParsing(t *testing.T) {
 // ponytail: satu check untuk mapping request OpenAI → wire (P0+P1).
 func TestRequestMapping(t *testing.T) {
 	p := func(v int) *int { return &v }
-	if got := resolveMaxTokens(chatReq{MaxTokens: p(50), MaxComplTok: p(99)}); got != 50 {
+	if got := resolveMaxTokens(chatRequest{MaxTokens: p(50), MaxCompletionTokens: p(99)}); got != 50 {
 		t.Fatalf("max_tokens must win, got %d", got)
 	}
-	if got := resolveMaxTokens(chatReq{MaxComplTok: p(200)}); got != 200 {
+	if got := resolveMaxTokens(chatRequest{MaxCompletionTokens: p(200)}); got != 200 {
 		t.Fatalf("max_completion_tokens fallback, got %d", got)
 	}
-	if got := resolveMaxTokens(chatReq{}); got != 1024 {
+	if got := resolveMaxTokens(chatRequest{}); got != 1024 {
 		t.Fatalf("default 1024, got %d", got)
 	}
 	if got := mapFinish(0, "length"); got != "length" {
@@ -70,13 +70,13 @@ func TestRequestMapping(t *testing.T) {
 	if got := mapFinish(0, "end_turn"); got != "stop" {
 		t.Fatalf("default stop, got %q", got)
 	}
-	if got := sessionAffinity(chatReq{PromptCacheKey: "pc", User: "u"}); got != "pc" {
+	if got := sessionAffinity(chatRequest{PromptCacheKey: "pc", User: "u"}); got != "pc" {
 		t.Fatalf("prompt_cache_key wins, got %q", got)
 	}
-	if got := sessionAffinity(chatReq{User: "u"}); got != "u" {
+	if got := sessionAffinity(chatRequest{User: "u"}); got != "u" {
 		t.Fatalf("user fallback, got %q", got)
 	}
-	if got := sessionAffinity(chatReq{}); got != "" {
+	if got := sessionAffinity(chatRequest{}); got != "" {
 		t.Fatalf("empty affinity, got %q", got)
 	}
 	if a, b := newRespID(), newRespID(); a == b {

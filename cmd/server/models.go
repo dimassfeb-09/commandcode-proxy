@@ -1,5 +1,26 @@
 package main
 
+// validModels passed a live "hi" probe per model on 2026-09-03 on this
+// account (36/65). Hardcoded: the gateway exposes no list-models endpoint.
+var validModels = []string{
+	"xiaomi/mimo-v2.5", "xiaomi/mimo-v2.5-pro",
+	"Qwen/Qwen3.8-Max", "Qwen/Qwen3.8-Flash", "Qwen/Qwen3.8-27B",
+	"Qwen/Qwen3.7-Max", "Qwen/Qwen3.7-Plus", "Qwen/Qwen3.7-Flash",
+	"Qwen/Qwen3.6-Max-Preview", "Qwen/Qwen3.6-Plus",
+	"zai-org/GLM-5.3", "zai-org/GLM-5.2", "zai-org/GLM-5.1", "zai-org/GLM-5",
+	"zai-org/GLM-5.2-Fast", "z-ai/glm-5.3-flash",
+	"moonshotai/Kimi-K3", "moonshotai/Kimi-K2.7-Code", "moonshotai/Kimi-K2.7-Code-Highspeed",
+	"moonshotai/Kimi-K2.6", "moonshotai/Kimi-K2.5",
+	"deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash",
+	"deepseek/deepseek-v4-flash-fast", "deepseek/deepseek-v4-flash-vision-exp",
+	"MiniMaxAI/MiniMax-M3", "MiniMaxAI/MiniMax-M2.5",
+	"stepfun/Step-3.7-Flash", "stepfun/Step-3.5-Flash",
+	"tencent/hy3-paid", "tencent/hy4-preview",
+	"gpt-5.6-luna", "xai/grok-4.5",
+	"thinkingmachines/inkling", "thinkingmachines/inkling-small",
+	"meta/muse-spark-1.2-contributor",
+}
+
 // modelMeta: metadata per model, diekstrak dari registry statis CLI (qR).
 // Diregenerate tiap update command-code; bukan dari endpoint (tidak ada).
 type modelMeta struct {
