@@ -413,14 +413,26 @@ func doUpstream(r *http.Request, key, sess string, body []byte) (*http.Response,
 		// afinitas sesi gateway (KV-cache locality); dari prompt_cache_key/user client.
 		req.Header.Set("x-session-id", sess)
 	}
-	return http.DefaultClient.Do(req)
+	return upstreamClient.Do(req)
 }
+
+// upstreamClient: satu client dipakai semua goroutine (aman + connection reuse).
+// ResponseHeaderTimeout agar upstream macet gagal-cepat, bukan gantung goroutine.
+// Tanpa Timeout total: stream SSE sah bisa jalan bermenit-menit.
+var upstreamClient = &http.Client{Transport: func() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.ResponseHeaderTimeout = 2 * time.Minute
+	return t
+}()}
 
 func handleChat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	// ponytail: batasi body 32MB — history full-resend bisa besar, tapi tanpa
+	// batas satu client raksasa bisa OOM-kan server untuk semua request lain.
+	r.Body = http.MaxBytesReader(w, r.Body, 32<<20)
 	raw, _ := io.ReadAll(r.Body)
 	var in chatReq
 	if err := json.Unmarshal(raw, &in); err != nil {
@@ -819,5 +831,17 @@ func main() {
 		w.Write([]byte(`{"status":"ok","model":"` + upstreamModel + `"}`))
 	})
 	fmt.Printf("commandcode-proxy → %s default=%s :%s\n", baseURL(), upstreamModel, port)
-	http.ListenAndServe(":"+port, mux)
+	// ponytail: ReadHeaderTimeout anti-slowloris + IdleTimeout bersih-bersih
+	// koneksi idle. TANPA ReadTimeout/WriteTimeout: SSE sah idle lama antar
+	// token dan request body besar — timeout itu akan membunuh request valid.
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		fmt.Fprintln(os.Stderr, "listen:", err)
+		os.Exit(1)
+	}
 }
