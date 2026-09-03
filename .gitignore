@@ -1,0 +1,6 @@
+/server
+/commandcode-proxy
+*.exe
+*.test
+*.out
+.DS_Store
