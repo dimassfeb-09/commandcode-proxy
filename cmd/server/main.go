@@ -3,6 +3,9 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -49,6 +52,38 @@ func apiKey() string {
 		return ""
 	}
 	return a.APIKey
+}
+
+// proxyAPIKey: Bearer key untuk /v1/*, diisi dari PROXY_API_KEY
+// atau di-generate tiap run bila env kosong.
+var proxyAPIKey string
+
+func genProxyKey() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		panic("rand: " + err.Error())
+	}
+	return "ccp_" + hex.EncodeToString(b)
+}
+
+// proxyAuth: tolak /v1/* tanpa Bearer yang cocok. /health tetap terbuka
+// untuk healthcheck (Fly/docker). Compare constant-time.
+func proxyAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		h := r.Header.Get("Authorization")
+		got := ""
+		if strings.HasPrefix(h, "Bearer ") {
+			got = strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+		}
+		if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(proxyAPIKey)) != 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+				"message": "invalid proxy api key", "type": "invalid_request_error", "code": "invalid_api_key"}})
+			return
+		}
+		next(w, r)
+	}
 }
 
 // ── OpenAI in ──
@@ -561,9 +596,15 @@ func main() {
 	if port == "" {
 		port = defaultPort
 	}
+	// ponytail: key generated at RUN, not build — baked-in key is same for everyone, useless.
+	proxyAPIKey = strings.TrimSpace(os.Getenv("PROXY_API_KEY"))
+	if proxyAPIKey == "" {
+		proxyAPIKey = genProxyKey()
+		fmt.Printf("PROXY_API_KEY not set — generated: %s\n", proxyAPIKey)
+	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", handleChat)
-	mux.HandleFunc("/v1/models", handleModels)
+	mux.HandleFunc("/v1/chat/completions", proxyAuth(handleChat))
+	mux.HandleFunc("/v1/models", proxyAuth(handleModels))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"ok","model":"` + upstreamModel + `"}`))

@@ -38,7 +38,16 @@ Optional variables:
 | `COMMANDCODE_API_KEY` | - | API key (preferred) |
 | `COMMAND_CODE_API_KEY` | - | API key (alternate name) |
 | `COMMANDCODE_API_URL` | `https://api.commandcode.ai` | Upstream base URL |
+| `PROXY_API_KEY` | generated per run | Bearer key required by `/v1/*` clients |
 | `PORT` | `8080` | Listen port |
+
+On startup the server prints the generated key when `PROXY_API_KEY` is not set:
+
+```text
+PROXY_API_KEY not set — generated: ccp_abc123...
+```
+
+All `/v1/*` endpoints require `Authorization: Bearer <key>`. `/health` stays open for load balancer and container health checks. For a stable key across deploys, set `PROXY_API_KEY` explicitly (e.g. `fly secrets set PROXY_API_KEY="$(openssl rand -hex 32 | sed 's/^/ccp_/')"`).
 
 ## Build and Run
 
@@ -95,13 +104,13 @@ curl http://localhost:8080/health
 Point any OpenAI-compatible client at this server:
 
 - Base URL: `http://localhost:8080/v1`
-- API key: any non-empty string (upstream auth uses `COMMANDCODE_API_KEY` server-side)
+- API key: the `PROXY_API_KEY` value (generated at startup or set via env)
 - Model: any id from `GET /v1/models`, e.g. `xiaomi/mimo-v2.5`
 
 List models:
 
 ```bash
-curl http://localhost:8080/v1/models
+curl -H "Authorization: Bearer $PROXY_API_KEY" http://localhost:8080/v1/models
 ```
 
 Non-streaming completion:
@@ -109,6 +118,7 @@ Non-streaming completion:
 ```bash
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $PROXY_API_KEY" \
   -d '{"model":"xiaomi/mimo-v2.5","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
 
@@ -117,6 +127,7 @@ Streaming completion:
 ```bash
 curl -N http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $PROXY_API_KEY" \
   -d '{"model":"xiaomi/mimo-v2.5","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
@@ -125,7 +136,7 @@ Python (`openai` package):
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8080/v1", api_key="x")
+client = OpenAI(base_url="http://localhost:8080/v1", api_key=os.environ["PROXY_API_KEY"])
 resp = client.chat.completions.create(
     model="xiaomi/mimo-v2.5",
     messages=[{"role": "user", "content": "hi"}],
@@ -138,7 +149,7 @@ Node.js (`openai` package):
 ```js
 import OpenAI from "openai";
 
-const client = new OpenAI({ baseURL: "http://localhost:8080/v1", apiKey: "x" });
+const client = new OpenAI({ baseURL: "http://localhost:8080/v1", apiKey: process.env.PROXY_API_KEY });
 const resp = await client.chat.completions.create({
   model: "xiaomi/mimo-v2.5",
   messages: [{ role: "user", content: "hi" }],
