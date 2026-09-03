@@ -159,4 +159,16 @@ console.log(resp.choices[0].message.content);
 
 Tool calling works the standard OpenAI way: pass `tools` with `type: "function"`, receive `tool_calls` with `finish_reason: "tool_calls"`, then send results back as `role: "tool"` messages with matching `tool_call_id`.
 
+## Sessions and cache hits
+
+There is no server-side session. The proxy is stateless: continuity comes from the client resending the full message history on every request, exactly like the OpenAI API. (The CLI's `sess_*` id is local-only telemetry; upstream only accepts UUID `threadId`, so it is never sent.)
+
+Upstream prefix-caches identical prompt prefixes. To get cache hits across turns:
+
+- Keep `model`, `system`, `tools`, and message history byte-identical; only append new messages.
+- Do not reorder, rephrase, or drop history between turns.
+- Within one request the proxy re-POSTs the identical body while upstream reports `pause_turn` (up to 6 attempts), same as the CLI.
+
+`usage.prompt_tokens_details.cached_tokens` reports how many prompt tokens were cache hits. Verified: two identical requests scored 6144 then 7360 of 7397 prompt tokens cached.
+
 DeepSeek-style harness or any agent framework with an OpenAI-compatible provider: set provider base URL to `http://localhost:8080/v1`, api key to the user's CommandCode key, and model to one of the listed ids. Fetching is plain HTTP POST to `/v1/chat/completions` with SSE (`text/event-stream`) when `stream: true`, ending with `data: [DONE]`.
