@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -99,5 +102,104 @@ func TestOverflowMapping(t *testing.T) {
 	inner := e["error"].(map[string]any)
 	if inner["code"] != "context_length_exceeded" || inner["type"] != "invalid_request_error" {
 		t.Fatalf("bad shape: %v", e)
+	}
+}
+
+const fakeNDJSON = `{"type":"text-delta","text":"apple"}` + "\n" +
+	`{"type":"finish","finishReason":"end_turn","rawFinishReason":"end_turn","totalUsage":{"inputTokens":500,"outputTokens":2,"inputTokenDetails":{"cacheReadTokens":100,"cacheWriteTokens":50}}}` + "\n" +
+	`{"type":"provider-metadata","providerMetadata":{"gateway":{"generationId":"gen_t","routing":{"resolvedProvider":"xiaomi"}}}}` + "\n"
+
+func fakeUpstream(t *testing.T) *httptest.Server {
+	t.Helper()
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("User-Agent") != "cli" {
+			t.Errorf("missing cli user-agent")
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.Write([]byte(fakeNDJSON))
+	}))
+	t.Setenv("COMMANDCODE_API_URL", s.URL)
+	return s
+}
+
+func postChat(t *testing.T, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer testkey")
+	rr := httptest.NewRecorder()
+	handleChat(rr, req)
+	return rr
+}
+
+// ponytail: satu check end-to-end bentuk response (array content in, spec fields out).
+func TestHandlerShapes(t *testing.T) {
+	fakeUpstream(t)
+	rr := postChat(t, `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hi "},{"type":"image_url","image_url":{"url":"data:x"}}]}],"stream":false}`)
+	if rr.Code != 200 {
+		t.Fatalf("want 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var d map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &d); err != nil {
+		t.Fatal(err)
+	}
+	ch := d["choices"].([]any)[0].(map[string]any)
+	msg := ch["message"].(map[string]any)
+	if msg["content"] != "apple" {
+		t.Fatalf("bad content: %v", msg)
+	}
+	if _, ok := msg["refusal"]; !ok {
+		t.Fatal("message.refusal missing (spec required)")
+	}
+	if _, ok := ch["logprobs"]; !ok {
+		t.Fatal("choice.logprobs missing (spec required)")
+	}
+	u := d["usage"].(map[string]any)
+	if u["prompt_tokens_details"].(map[string]any)["cached_tokens"] != 100.0 {
+		t.Fatalf("bad cached: %v", u)
+	}
+	if d["system_fingerprint"] != "xiaomi:gen_t" {
+		t.Fatalf("bad fp: %v", d["system_fingerprint"])
+	}
+}
+
+// ponytail: satu check SSE (role di delta pertama, usage chunk choices kosong).
+func TestHandlerStreamShapes(t *testing.T) {
+	fakeUpstream(t)
+	rr := postChat(t, `{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_usage":true}}`)
+	if rr.Code != 200 {
+		t.Fatalf("want 200, got %d", rr.Code)
+	}
+	var firstRole string
+	var useChunk map[string]any
+	for _, line := range strings.Split(rr.Body.String(), "\n") {
+		line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if line == "" || line == "[DONE]" || !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var c map[string]any
+		if json.Unmarshal([]byte(line), &c) != nil {
+			continue
+		}
+		chs, _ := c["choices"].([]any)
+		if len(chs) > 0 {
+			if d, _ := chs[0].(map[string]any)["delta"].(map[string]any); d != nil {
+				if r, ok := d["role"].(string); ok && firstRole == "" {
+					firstRole = r
+				}
+			}
+		}
+		if u, ok := c["usage"]; ok && u != nil {
+			useChunk = c
+		}
+	}
+	if firstRole != "assistant" {
+		t.Fatalf("first delta must carry role assistant, got %q", firstRole)
+	}
+	if useChunk == nil {
+		t.Fatal("missing usage chunk")
+	}
+	if len(useChunk["choices"].([]any)) != 0 {
+		t.Fatal("usage chunk choices must be []")
 	}
 }

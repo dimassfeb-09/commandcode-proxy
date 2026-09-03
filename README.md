@@ -181,6 +181,10 @@ Upstream prefix-caches identical prompt prefixes. To get cache hits across turns
 
 Accepted OpenAI fields: `model`, `messages`, `tools`, `stream`, `stream_options.include_usage`, `max_tokens`, `max_completion_tokens` (fallback when `max_tokens` absent), `temperature`, `reasoning_effort` (forwarded to upstream), `user`, `prompt_cache_key`.
 
+Message `content` accepts string or array of parts; text parts are joined, image/audio parts are dropped (keeps the prefix lean and cache-stable).
+
+Fields without an upstream counterpart are accepted but ignored: `top_p`, `frequency_penalty`, `presence_penalty`, `seed`, `logit_bias`, `logprobs`, `stop`, `n` (always 1 choice), `response_format`, `tool_choice`, `parallel_tool_calls`, `modalities`, `prediction`, `metadata`, `store`. Responses include spec-required `refusal: null`, `logprobs: null`, and `role: "assistant"` on the first stream delta.
+
 - `finish_reason` is honest: upstream truncation surfaces as `"length"` (not `"stop"`), so clients continue instead of presenting cut-off text as final. `tool_calls` still takes precedence.
 - Every response has a unique `id` (`chatcmpl-cc-<rand>`).
 - `system_fingerprint` carries the upstream gateway routing (`provider:generationId`, e.g. `xiaomi:gen_...`). A provider change means the prefix cache is invalid — clients can watch this field.

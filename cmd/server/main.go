@@ -113,10 +113,37 @@ type tcCall struct {
 }
 
 type chatMsg struct {
-	Role       string   `json:"role"`
-	Content    string   `json:"content"`
-	ToolCalls  []tcCall `json:"tool_calls,omitempty"`
-	ToolCallID string   `json:"tool_call_id,omitempty"`
+	Role       string      `json:"role"`
+	Content    flexContent `json:"content"`
+	ToolCalls  []tcCall    `json:"tool_calls,omitempty"`
+	ToolCallID string      `json:"tool_call_id,omitempty"`
+}
+
+// flexContent: content OpenAI string|array[{type:text,...}].
+// Teks digabung; image/audio di-drop (hemat prefix, stabil cache).
+type flexContent struct{ text string }
+
+func (f *flexContent) UnmarshalJSON(b []byte) error {
+	var s string
+	if json.Unmarshal(b, &s) == nil {
+		f.text = s
+		return nil
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(b, &parts); err != nil {
+		return err
+	}
+	var sb strings.Builder
+	for _, p := range parts {
+		if p.Type == "" || p.Type == "text" {
+			sb.WriteString(p.Text)
+		}
+	}
+	f.text = sb.String()
+	return nil
 }
 
 type fnDef struct {
@@ -213,11 +240,11 @@ func toWireMessages(ms []chatMsg) (system string, out []any) {
 	for _, m := range ms {
 		switch m.Role {
 		case "system", "developer":
-			sys = append(sys, m.Content)
+			sys = append(sys, m.Content.text)
 		case "assistant":
 			var c []any
-			if m.Content != "" {
-				c = append(c, map[string]any{"type": "text", "text": m.Content})
+			if m.Content.text != "" {
+				c = append(c, map[string]any{"type": "text", "text": m.Content.text})
 			}
 			for _, tc := range m.ToolCalls {
 				var input any = map[string]any{}
@@ -240,10 +267,10 @@ func toWireMessages(ms []chatMsg) (system string, out []any) {
 			}
 			out = append(out, map[string]any{"role": "tool", "content": []any{map[string]any{
 				"type": "tool-result", "toolCallId": m.ToolCallID, "toolName": name,
-				"output": map[string]any{"type": "text", "value": m.Content},
+				"output": map[string]any{"type": "text", "value": m.Content.text},
 			}}})
 		default:
-			out = append(out, map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": m.Content}}})
+			out = append(out, map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": m.Content.text}}})
 		}
 	}
 	return strings.Join(sys, "\n"), out
@@ -482,14 +509,14 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 				calls = xc
 			}
 		}
-		msg := map[string]any{"role": "assistant", "content": sb.String()}
+		msg := map[string]any{"role": "assistant", "content": sb.String(), "refusal": nil}
 		finish := mapFinish(len(calls), rawLast)
 		if finish == "tool_calls" {
 			msg["tool_calls"] = calls
 		}
 		out := map[string]any{
 			"id": rid, "object": "chat.completion", "created": time.Now().Unix(), "model": model,
-			"choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": finish}},
+			"choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": finish, "logprobs": nil}},
 			"usage":   openaiUsage(u),
 		}
 		if fp != "" {
@@ -506,9 +533,15 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(200)
 	fl, _ := w.(http.Flusher)
 	var u usage
+	first := true // chunk delta pertama bawa role:assistant sesuai spec
 	emit := func(delta string, finish any) {
+		d := map[string]any{"content": delta}
+		if first && delta != "" {
+			d["role"] = "assistant"
+			first = false
+		}
 		chunk := map[string]any{"id": rid, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model,
-			"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": delta}, "finish_reason": finish}}}
+			"choices": []any{map[string]any{"index": 0, "delta": d, "finish_reason": finish, "logprobs": nil}}}
 		b, _ := json.Marshal(chunk)
 		fmt.Fprintf(w, "data: %s\n\n", b)
 		if fl != nil {
@@ -584,7 +617,7 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 			emitTC(calls, 0)
 		}
 		finChunk := map[string]any{"id": rid, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model,
-			"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": ""}, "finish_reason": finish}}}
+			"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": ""}, "finish_reason": finish, "logprobs": nil}}}
 		useChunk := map[string]any{"id": rid, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model,
 			"choices": []any{}, "usage": openaiUsage(u)}
 		if fp != "" {
